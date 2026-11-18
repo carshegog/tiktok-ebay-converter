@@ -276,21 +276,21 @@ if page == "Create Listing":
 
     st.header("Create an eBay Listing")
 
-  source_platform = st.selectbox(
-    "Where is your product from?",
-    ["TikTok Shop", "Amazon"]
-)
-
-st.write(f"Paste your {source_platform} product link.")
-
-url = st.text_input(
-    f"{source_platform} Product URL",
-    placeholder=(
-        "https://www.tiktok.com/..."
-        if source_platform == "TikTok Shop"
-        else "https://www.amazon.com/..."
+    source_platform = st.selectbox(
+        "Where is your product from?",
+        ["TikTok Shop", "Amazon"]
     )
-)
+
+    st.write(f"Paste your {source_platform} product link.")
+
+    url = st.text_input(
+        f"{source_platform} Product URL",
+        placeholder=(
+            "https://www.tiktok.com/..."
+            if source_platform == "TikTok Shop"
+            else "https://www.amazon.com/..."
+        )
+    )
 
     if st.button("Extract Product Information"):
         if not url:
