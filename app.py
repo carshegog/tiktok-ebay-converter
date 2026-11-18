@@ -96,34 +96,74 @@ def extract_product(url):
     if parsed.scheme not in ("http", "https"):
         raise ValueError("Invalid URL.")
 
-    if parsed.hostname not in (
-        "tiktok.com",
-        "www.tiktok.com",
-        "m.tiktok.com",
-        "vm.tiktok.com",
-        "vt.tiktok.com"
-    ):
-        raise ValueError("Please enter a TikTok product URL.")
+    host = (parsed.hostname or "").lower()
+
+    is_tiktok = (
+        host == "tiktok.com"
+        or host.endswith(".tiktok.com")
+    )
+
+    is_amazon = (
+        host == "amazon.com"
+        or host.endswith(".amazon.com")
+        or host == "amzn.to"
+    )
+
+    if not is_tiktok and not is_amazon:
+        raise ValueError(
+            "Please enter a TikTok Shop or Amazon product URL."
+        )
 
     response = requests.get(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; ListingHelper/1.0)"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+            )
         },
-        timeout=15
+        timeout=20,
+        allow_redirects=True
     )
 
     response.raise_for_status()
+
+    # Verify that redirects stay on an accepted platform.
+    final_host = (
+        urlparse(response.url).hostname or ""
+    ).lower()
+
+    final_tiktok = (
+        final_host == "tiktok.com"
+        or final_host.endswith(".tiktok.com")
+    )
+
+    final_amazon = (
+        final_host == "amazon.com"
+        or final_host.endswith(".amazon.com")
+    )
+
+    if not final_tiktok and not final_amazon:
+        raise ValueError(
+            "The link redirected to an unsupported website."
+        )
 
     soup = BeautifulSoup(response.text, "html.parser")
 
     def meta(*names):
         for name in names:
-            tag = soup.find("meta", attrs={"property": name})
+            tag = soup.find(
+                "meta", attrs={"property": name}
+            )
+
             if not tag:
-                tag = soup.find("meta", attrs={"name": name})
+                tag = soup.find(
+                    "meta", attrs={"name": name}
+                )
+
             if tag and tag.get("content"):
                 return clean(tag["content"])
+
         return ""
 
     product = {}
@@ -132,14 +172,20 @@ def extract_product(url):
         "script", type="application/ld+json"
     ):
         try:
-            data = json.loads(tag.string or tag.get_text())
+            data = json.loads(
+                tag.string or tag.get_text()
+            )
+
             product = find_product(data) or {}
+
             if product:
                 break
+
         except Exception:
             continue
 
     name = clean(product.get("name"))
+
     if not name:
         name = meta("og:title", "twitter:title")
 
@@ -147,12 +193,19 @@ def extract_product(url):
         name = clean(soup.title.string)
 
     description = clean(product.get("description"))
+
     if not description:
-        description = meta("og:description", "description")
+        description = meta(
+            "og:description", "description"
+        )
 
     brand = product.get("brand", "")
+
     if isinstance(brand, dict):
         brand = brand.get("name", "")
+
+    if not brand:
+        brand = meta("product:brand")
 
     price = ""
     offers = product.get("offers", {})
@@ -163,13 +216,18 @@ def extract_product(url):
     if isinstance(offers, dict):
         price = offers.get("price", "")
 
+    if not price:
+        price = meta(
+            "product:price:amount",
+            "og:price:amount"
+        )
+
     return {
         "name": name,
         "description": description,
         "brand": clean(brand),
         "price": price
     }
-
 
 # --------------------------------
 # SKU GENERATOR
