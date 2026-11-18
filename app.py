@@ -1,135 +1,613 @@
+import streamlit as st
+import pandas as pd
+import requests
+import re
+import json
 import csv
 import io
-import re
-from datetime import datetime, timezone
+import hmac
+from bs4 import BeautifulSoup
 from urllib.parse import urlparse
+from supabase import create_client
 
-import streamlit as st
-
-st.set_page_config(page_title="TikTok → eBay Draft Builder", page_icon="🛍️", layout="centered")
-
-st.title("TikTok → eBay Draft Builder")
-st.caption("Semi-automated listing helper • TikTok link in, editable eBay draft out")
-
-st.info(
-    "This starter app does not scrape TikTok Shop pages or copy their photos. "
-    "Paste the product link, then enter/confirm the product details yourself. "
-    "Only list items you are authorized to resell, and use your own accurate photos."
+st.set_page_config(
+    page_title="TikTok to eBay Manager",
+    page_icon="🛍️",
+    layout="wide"
 )
 
-def clean_text(value: str) -> str:
-    return re.sub(r"\s+", " ", (value or "")).strip()
+# --------------------------------
+# SECURITY
+# --------------------------------
 
-def make_title(name, brand, condition, keywords):
-    parts = [clean_text(brand), clean_text(name), clean_text(condition), clean_text(keywords)]
-    title = " ".join(p for p in parts if p)
-    return title[:80]
+st.title("🛍️ TikTok → eBay Manager")
 
-def make_description(name, brand, condition, details, shipping):
-    lines = [
-        clean_text(name) or "Item",
-        "",
-        f"Brand: {clean_text(brand) or 'Not specified'}",
-        f"Condition: {clean_text(condition) or 'Not specified'}",
-        "",
-        clean_text(details) or "Please review the photos and item details before purchasing.",
-        "",
-        f"Shipping: {clean_text(shipping) or 'Ships securely; handling time to be confirmed.'}",
-        "",
-        "Please message me with any questions before purchasing."
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+try:
+    APP_PASSWORD = st.secrets["APP_PASSWORD"]
+except Exception:
+    st.error("APP_PASSWORD is missing from Streamlit Secrets.")
+    st.stop()
+
+if not st.session_state.authenticated:
+    password = st.text_input("Dashboard password", type="password")
+
+    if st.button("Log in", type="primary"):
+        if hmac.compare_digest(password, APP_PASSWORD):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+    st.stop()
+
+# --------------------------------
+# DATABASE CONNECTION
+# --------------------------------
+
+@st.cache_resource
+def get_database():
+    return create_client(
+        st.secrets["SUPABASE_URL"],
+        st.secrets["SUPABASE_SECRET_KEY"]
+    )
+
+try:
+    db = get_database()
+except Exception as e:
+    st.error(f"Database connection failed: {e}")
+    st.stop()
+
+# --------------------------------
+# PRODUCT EXTRACTION
+# --------------------------------
+
+def clean(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def find_product(data):
+    if isinstance(data, list):
+        for item in data:
+            result = find_product(item)
+            if result:
+                return result
+
+    if isinstance(data, dict):
+        if data.get("@type") == "Product" or (
+            isinstance(data.get("@type"), list)
+            and "Product" in data.get("@type", [])
+        ):
+            return data
+
+        for value in data.values():
+            result = find_product(value)
+            if result:
+                return result
+
+    return None
+
+
+def extract_product(url):
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Invalid URL.")
+
+    if parsed.hostname not in (
+        "tiktok.com",
+        "www.tiktok.com",
+        "m.tiktok.com",
+        "vm.tiktok.com",
+        "vt.tiktok.com"
+    ):
+        raise ValueError("Please enter a TikTok product URL.")
+
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; ListingHelper/1.0)"
+        },
+        timeout=15
+    )
+
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    def meta(*names):
+        for name in names:
+            tag = soup.find("meta", attrs={"property": name})
+            if not tag:
+                tag = soup.find("meta", attrs={"name": name})
+            if tag and tag.get("content"):
+                return clean(tag["content"])
+        return ""
+
+    product = {}
+
+    for tag in soup.find_all(
+        "script", type="application/ld+json"
+    ):
+        try:
+            data = json.loads(tag.string or tag.get_text())
+            product = find_product(data) or {}
+            if product:
+                break
+        except Exception:
+            continue
+
+    name = clean(product.get("name"))
+    if not name:
+        name = meta("og:title", "twitter:title")
+
+    if not name and soup.title:
+        name = clean(soup.title.string)
+
+    description = clean(product.get("description"))
+    if not description:
+        description = meta("og:description", "description")
+
+    brand = product.get("brand", "")
+    if isinstance(brand, dict):
+        brand = brand.get("name", "")
+
+    price = ""
+    offers = product.get("offers", {})
+
+    if isinstance(offers, list) and offers:
+        offers = offers[0]
+
+    if isinstance(offers, dict):
+        price = offers.get("price", "")
+
+    return {
+        "name": name,
+        "description": description,
+        "brand": clean(brand),
+        "price": price
+    }
+
+
+# --------------------------------
+# SKU GENERATOR
+# --------------------------------
+
+def generate_sku():
+    result = db.table("inventory").select("sku").execute()
+
+    highest = 0
+
+    for item in result.data or []:
+        match = re.fullmatch(
+            r"TTE-(\d+)",
+            item.get("sku", "")
+        )
+        if match:
+            highest = max(highest, int(match.group(1)))
+
+    return f"TTE-{highest + 1:05d}"
+
+
+# --------------------------------
+# SIDEBAR NAVIGATION
+# --------------------------------
+
+st.sidebar.title("Navigation")
+
+page = st.sidebar.radio(
+    "Choose a section",
+    [
+        "Create Listing",
+        "My Inventory",
+        "Dashboard"
     ]
-    return "\n".join(lines)
+)
 
-with st.form("listing_form"):
-    st.subheader("1. Product source")
-    source_url = st.text_input("TikTok Shop product URL", placeholder="https://www.tiktok.com/...")
-    st.caption("The link is saved into your draft as a reference; product data is not automatically extracted.")
+if st.sidebar.button("Log out"):
+    st.session_state.authenticated = False
+    st.rerun()
 
-    st.subheader("2. Confirm the item details")
-    name = st.text_input("Product name *", placeholder="e.g. Stainless steel water bottle")
-    brand = st.text_input("Brand", placeholder="e.g. Contigo")
-    condition = st.selectbox("Condition", ["New", "New with tags", "New without tags", "Open box", "Pre-owned"])
-    details = st.text_area("Description / features", placeholder="Size, color, material, included accessories, flaws, measurements...")
-    keywords = st.text_input("Extra search keywords", placeholder="e.g. insulated, travel, 24 oz")
-    price = st.number_input("Your intended eBay price (USD)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
-    quantity = st.number_input("Quantity", min_value=1, value=1, step=1)
-    sku = st.text_input("SKU (optional)", placeholder="Leave blank to generate one")
-    shipping = st.text_input("Shipping note", value="Ships securely; handling time to be confirmed.")
-    submitted = st.form_submit_button("Generate draft", type="primary")
+# --------------------------------
+# CREATE LISTING
+# --------------------------------
 
-if submitted:
-    parsed = urlparse(source_url.strip())
-    if not source_url.strip() or parsed.scheme not in ("http", "https") or not parsed.netloc:
-        st.error("Enter a valid product URL beginning with http:// or https://.")
-    elif not clean_text(name):
-        st.error("Add a product name before generating the draft.")
-    elif price <= 0:
-        st.error("Enter a price greater than $0.")
-    else:
-        generated_sku = clean_text(sku) or "TT-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        draft = {
-            "title": make_title(name, brand, condition, keywords),
-            "description": make_description(name, brand, condition, details, shipping),
-            "price": f"{price:.2f}",
-            "quantity": str(quantity),
-            "sku": generated_sku,
-            "condition": condition,
-            "source_url": source_url.strip(),
-            "status": "DRAFT - REVIEW BEFORE LISTING",
+if page == "Create Listing":
+
+    st.header("Create an eBay Listing")
+
+    st.write("Paste a TikTok Shop product link to begin.")
+
+    url = st.text_input(
+        "TikTok Product URL",
+        placeholder="https://www.tiktok.com/..."
+    )
+
+    if st.button("Extract Product Information"):
+        if not url:
+            st.error("Paste a product link first.")
+        else:
+            try:
+                extracted = extract_product(url)
+                st.session_state.extracted = extracted
+                st.session_state.source_url = url
+
+                if extracted["name"]:
+                    st.success("Product information retrieved.")
+                else:
+                    st.warning(
+                        "TikTok did not provide a product name. "
+                        "Please enter it manually."
+                    )
+
+            except Exception as e:
+                st.warning(
+                    "Automatic extraction was unsuccessful. "
+                    "TikTok may restrict access to its product pages."
+                )
+                st.caption(str(e))
+                st.session_state.extracted = {}
+                st.session_state.source_url = url
+
+    if "extracted" in st.session_state:
+
+        data = st.session_state.extracted
+
+        st.divider()
+        st.subheader("Review Product Information")
+
+        name = st.text_input(
+            "Product Name",
+            value=data.get("name", "")
+        )
+
+        brand = st.text_input(
+            "Brand",
+            value=data.get("brand", "")
+        )
+
+        description = st.text_area(
+            "Product Description",
+            value=data.get("description", ""),
+            height=140
+        )
+
+        condition = st.selectbox(
+            "Condition",
+            [
+                "New",
+                "New with tags",
+                "New without tags",
+                "Open box",
+                "Pre-owned"
+            ]
+        )
+
+        price_default = 0.0
+        try:
+            price_default = float(data.get("price") or 0)
+        except (ValueError, TypeError):
+            pass
+
+        price = st.number_input(
+            "eBay Selling Price ($)",
+            min_value=0.0,
+            value=price_default,
+            step=1.0
+        )
+
+        quantity = st.number_input(
+            "Quantity",
+            min_value=1,
+            value=1,
+            step=1
+        )
+
+        keywords = st.text_input(
+            "Additional Search Keywords"
+        )
+
+        if st.button("Generate eBay Draft", type="primary"):
+
+            if not name.strip():
+                st.error("Enter a product name.")
+            elif price <= 0:
+                st.error("Enter a valid selling price.")
+            else:
+
+                title = " ".join(
+                    x for x in [
+                        brand,
+                        name,
+                        condition,
+                        keywords
+                    ] if clean(x)
+                )[:80]
+
+                final_description = (
+                    f"{name}\n\n"
+                    f"Brand: {brand or 'Not specified'}\n"
+                    f"Condition: {condition}\n\n"
+                    f"{description}\n\n"
+                    "Please review all photos and details "
+                    "before purchasing."
+                )
+
+                st.session_state.draft = {
+                    "sku": generate_sku(),
+                    "product_name": name,
+                    "brand": brand,
+                    "title": title,
+                    "description": final_description,
+                    "price": price,
+                    "quantity": quantity,
+                    "condition": condition,
+                    "tiktok_url": st.session_state.source_url
+                }
+
+                st.rerun()
+
+    if "draft" in st.session_state:
+
+        draft = st.session_state.draft
+
+        st.divider()
+        st.subheader("Your Generated eBay Draft")
+
+        st.success(f"Assigned SKU: {draft['sku']}")
+
+        final_title = st.text_input(
+            "eBay Title",
+            value=draft["title"],
+            max_chars=80
+        )
+
+        final_description = st.text_area(
+            "eBay Description",
+            value=draft["description"],
+            height=200
+        )
+
+        final_price = st.number_input(
+            "Final Price ($)",
+            min_value=0.01,
+            value=float(draft["price"]),
+            step=1.0
+        )
+
+        ebay_csv = {
+            "SKU": draft["sku"],
+            "Title": final_title,
+            "Description": final_description,
+            "Price": f"{final_price:.2f}",
+            "Quantity": str(draft["quantity"]),
+            "Condition": draft["condition"]
         }
-        st.session_state["draft"] = draft
 
-if "draft" in st.session_state:
-    draft = st.session_state["draft"]
-    st.divider()
-    st.subheader("3. Review and edit your draft")
-    title = st.text_input("eBay title (80-character limit)", value=draft["title"], max_chars=80)
-    description = st.text_area("eBay description", value=draft["description"], height=220)
-    col1, col2 = st.columns(2)
-    with col1:
-        final_price = st.text_input("Price (USD)", value=draft["price"])
-    with col2:
-        final_quantity = st.number_input("Quantity ", min_value=1, value=int(draft["quantity"]), step=1)
-    final_sku = st.text_input("SKU", value=draft["sku"])
+        buffer = io.StringIO()
+        writer = csv.DictWriter(
+            buffer,
+            fieldnames=ebay_csv.keys()
+        )
+        writer.writeheader()
+        writer.writerow(ebay_csv)
+
+        st.download_button(
+            "Download eBay Draft CSV",
+            data=buffer.getvalue().encode("utf-8-sig"),
+            file_name=f"{draft['sku']}.csv",
+            mime="text/csv"
+        )
+
+        st.info(
+            "After creating the listing on eBay, "
+            "return here and confirm that it is listed."
+        )
+
+        ebay_url = st.text_input(
+            "Your eBay Listing URL",
+            placeholder="https://www.ebay.com/itm/..."
+        )
+
+        if st.button("Confirm Listed & Save to Inventory", type="primary"):
+
+            parsed = urlparse(ebay_url.strip())
+
+            if (
+                parsed.scheme not in ("http", "https")
+                or not parsed.hostname
+                or not (
+                    parsed.hostname == "ebay.com"
+                    or parsed.hostname.endswith(".ebay.com")
+                )
+            ):
+                st.error("Enter a valid eBay listing URL.")
+            else:
+                record = {
+                    "sku": draft["sku"],
+                    "product_name": draft["product_name"],
+                    "brand": draft["brand"],
+                    "tiktok_url": draft["tiktok_url"],
+                    "ebay_url": ebay_url.strip(),
+                    "ebay_title": final_title,
+                    "description": final_description,
+                    "price": float(final_price),
+                    "quantity": int(draft["quantity"]),
+                    "status": "Active"
+                }
+
+                try:
+                    db.table("inventory").insert(record).execute()
+
+                    st.success(
+                        f"Successfully saved {draft['sku']} "
+                        "to your inventory!"
+                    )
+
+                    del st.session_state["draft"]
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Could not save listing: {e}")
+
+
+# --------------------------------
+# MY INVENTORY
+# --------------------------------
+
+elif page == "My Inventory":
+
+    st.header("📦 My eBay Inventory")
 
     try:
-        valid_price = float(final_price) > 0
-    except ValueError:
-        valid_price = False
+        result = (
+            db.table("inventory")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
 
-    if not valid_price:
-        st.warning("Enter a valid price greater than $0 to export.")
-    else:
-        final_draft = {
-            "title": title[:80],
-            "description": description,
-            "price": f"{float(final_price):.2f}",
-            "quantity": str(final_quantity),
-            "sku": final_sku,
-            "condition": draft["condition"],
-            "source_url": draft["source_url"],
-            "status": "DRAFT - REVIEW BEFORE LISTING",
-        }
-        buffer = io.StringIO()
-        writer = csv.DictWriter(buffer, fieldnames=list(final_draft.keys()))
-        writer.writeheader()
-        writer.writerow(final_draft)
-        st.download_button(
-            "Download eBay draft CSV",
-            data=buffer.getvalue().encode("utf-8-sig"),
-            file_name="ebay_listing_draft.csv",
-            mime="text/csv",
-            type="primary",
+        inventory = result.data or []
+
+        if not inventory:
+            st.info("You haven't saved any listings yet.")
+
+        else:
+            st.write(f"Total saved products: {len(inventory)}")
+
+            for item in inventory:
+
+                with st.expander(
+                    f"{item['sku']} — {item['product_name']}"
+                ):
+
+                    st.write(
+                        f"**Brand:** {item.get('brand') or 'Not specified'}"
+                    )
+
+                    st.write(
+                        f"**Price:** ${item.get('price') or 0:.2f}"
+                    )
+
+                    st.write(
+                        f"**Status:** {item.get('status', 'Active')}"
+                    )
+
+                    st.markdown(
+                        f"[Open TikTok Product]({item['tiktok_url']})"
+                    )
+
+                    if item.get("ebay_url"):
+                        st.markdown(
+                            f"[Open eBay Listing]({item['ebay_url']})"
+                        )
+
+                    new_status = st.selectbox(
+                        "Update Listing Status",
+                        ["Active", "Sold", "Ended"],
+                        index=["Active", "Sold", "Ended"].index(
+                            item.get("status", "Active")
+                            if item.get("status") in
+                            ["Active", "Sold", "Ended"]
+                            else "Active"
+                        ),
+                        key=f"status_{item['id']}"
+                    )
+
+                    new_ebay_url = st.text_input(
+                        "eBay URL",
+                        value=item.get("ebay_url") or "",
+                        key=f"url_{item['id']}"
+                    )
+
+                    if st.button(
+                        "Save Changes",
+                        key=f"save_{item['id']}"
+                    ):
+                        db.table("inventory").update({
+                            "status": new_status,
+                            "ebay_url": new_ebay_url
+                        }).eq("id", item["id"]).execute()
+
+                        st.success("Inventory updated.")
+                        st.rerun()
+
+    except Exception as e:
+        st.error(f"Could not load inventory: {e}")
+
+
+# --------------------------------
+# DASHBOARD
+# --------------------------------
+
+elif page == "Dashboard":
+
+    st.header("📊 Inventory Dashboard")
+
+    try:
+        result = db.table("inventory").select("*").execute()
+        items = result.data or []
+
+        active = sum(
+            1 for x in items if x.get("status") == "Active"
         )
-        st.download_button(
-            "Download draft as text",
-            data=(f"TITLE\n{final_draft['title']}\n\nDESCRIPTION\n{final_draft['description']}\n\n"
-                  f"PRICE: ${final_draft['price']}\nQUANTITY: {final_draft['quantity']}\n"
-                  f"SKU: {final_draft['sku']}\nSOURCE: {final_draft['source_url']}\n").encode("utf-8"),
-            file_name="ebay_listing_draft.txt",
-            mime="text/plain",
+
+        sold = sum(
+            1 for x in items if x.get("status") == "Sold"
         )
-        st.caption("The CSV is a portable draft for review, not a guaranteed eBay bulk-upload template.")
+
+        ended = sum(
+            1 for x in items if x.get("status") == "Ended"
+        )
+
+        revenue = sum(
+            float(x.get("price") or 0)
+            for x in items
+            if x.get("status") == "Sold"
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        col1.metric("Total Listings", len(items))
+        col2.metric("Active", active)
+        col3.metric("Sold", sold)
+        col4.metric("Ended", ended)
+
+        st.divider()
+
+        st.metric(
+            "Value of Sold Listings",
+            f"${revenue:,.2f}"
+        )
+
+        if items:
+            df = pd.DataFrame(items)
+
+            st.subheader("Recent Inventory")
+
+            st.dataframe(
+                df[
+                    [
+                        "sku",
+                        "product_name",
+                        "price",
+                        "quantity",
+                        "status"
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True
+            )
+
+    except Exception as e:
+        st.error(f"Dashboard error: {e}")
+
 
 st.divider()
-st.caption("Before listing: verify item specifics, category, shipping, fees, brand authenticity, resale rights, and eBay policies.")
+
+st.caption(
+    "TikTok → eBay Manager | Inventory stored securely in Supabase. "
+    "Verify all product details and eBay policies before listing."
+)
