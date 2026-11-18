@@ -298,9 +298,9 @@ if page == "Create Listing":
         else:
             try:
                 extracted = extract_product(url)
-st.session_state.extracted = extracted
-st.session_state.source_url = url
-st.session_state.source_platform = source_platform
+                st.session_state.extracted = extracted
+                st.session_state.source_url = url
+                st.session_state.source_platform = source_platform
 
                 if extracted["name"]:
                     st.success("Product information retrieved.")
