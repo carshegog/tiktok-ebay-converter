@@ -276,12 +276,21 @@ if page == "Create Listing":
 
     st.header("Create an eBay Listing")
 
-    st.write("Paste a TikTok Shop product link to begin.")
+  source_platform = st.selectbox(
+    "Where is your product from?",
+    ["TikTok Shop", "Amazon"]
+)
 
-    url = st.text_input(
-        "TikTok Product URL",
-        placeholder="https://www.tiktok.com/..."
+st.write(f"Paste your {source_platform} product link.")
+
+url = st.text_input(
+    f"{source_platform} Product URL",
+    placeholder=(
+        "https://www.tiktok.com/..."
+        if source_platform == "TikTok Shop"
+        else "https://www.amazon.com/..."
     )
+)
 
     if st.button("Extract Product Information"):
         if not url:
@@ -289,8 +298,9 @@ if page == "Create Listing":
         else:
             try:
                 extracted = extract_product(url)
-                st.session_state.extracted = extracted
-                st.session_state.source_url = url
+st.session_state.extracted = extracted
+st.session_state.source_url = url
+st.session_state.source_platform = source_platform
 
                 if extracted["name"]:
                     st.success("Product information retrieved.")
@@ -308,6 +318,7 @@ if page == "Create Listing":
                 st.caption(str(e))
                 st.session_state.extracted = {}
                 st.session_state.source_url = url
+                st.session_state.source_platform = source_platform
 
     if "extracted" in st.session_state:
 
@@ -402,7 +413,9 @@ if page == "Create Listing":
                     "price": price,
                     "quantity": quantity,
                     "condition": condition,
-                    "tiktok_url": st.session_state.source_url
+                    "source_url": st.session_state.source_url,
+                    "source_platform": st.session_state.source_platform
+
                 }
 
                 st.rerun()
@@ -487,7 +500,9 @@ if page == "Create Listing":
                     "sku": draft["sku"],
                     "product_name": draft["product_name"],
                     "brand": draft["brand"],
-                    "tiktok_url": draft["tiktok_url"],
+                    "tiktok_url": draft["source_url"],
+                    "source_url": draft["source_url"],
+                    "source_platform": draft["source_platform"],
                     "ebay_url": ebay_url.strip(),
                     "ebay_title": final_title,
                     "description": final_description,
@@ -558,8 +573,11 @@ elif page == "My Inventory":
                     )
 
                     if item.get("ebay_url"):
+                        platform = item.get("source_platform") or "TikTok Shop"
+                        source_link = item.get("source_url") or item.get("tiktok_url")
+
                         st.markdown(
-                            f"[Open eBay Listing]({item['ebay_url']})"
+                            f"[Open {platform} Product]({source_link})"
                         )
 
                     new_status = st.selectbox(
